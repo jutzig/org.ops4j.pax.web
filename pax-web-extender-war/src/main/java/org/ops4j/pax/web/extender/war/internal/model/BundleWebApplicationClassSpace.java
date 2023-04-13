@@ -58,9 +58,13 @@ import org.ops4j.pax.web.service.spi.util.Utils;
 import org.ops4j.pax.web.utils.ClassPathUtil;
 import org.osgi.framework.Bundle;
 import org.osgi.framework.Constants;
+import org.osgi.framework.namespace.BundleNamespace;
 import org.osgi.framework.namespace.HostNamespace;
+import org.osgi.framework.namespace.PackageNamespace;
+import org.osgi.framework.wiring.BundleRevision;
 import org.osgi.framework.wiring.BundleWire;
 import org.osgi.framework.wiring.BundleWiring;
+import org.osgi.namespace.extender.ExtenderNamespace;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -365,12 +369,12 @@ public class BundleWebApplicationClassSpace {
 			bundles.add(undertowWebSocketBundle);
 		}
 
-		Set<Bundle> reached = new HashSet<>();
-		while (bundles.size() > 0) {
+		// first we need to check the direct dependencies of the 'roots' and analyze those as well
+		Set<Bundle> toProcess = new LinkedHashSet<>();
+		for (Bundle scannedBundle : bundles) {
 			// org.apache.tomcat.util.scan.StandardJarScanner.processURLs() - Tomcat traverses CL hierarchy
 			// and collects non-filtered (see conf/catalina.properties:
 			// "tomcat.util.scan.StandardJarScanFilter.jarsToSkip" property) JARs from all URLClassLoaders
-			Bundle scannedBundle = bundles.pop();
 			if (extenderContext.skipBundleScanning(scannedBundle) || scannedBundle.getBundleId() == 0L) {
 				if (processedBundles.add(scannedBundle)) {
 					LOG.trace("  Skipped checking of wired bundle {}", scannedBundle);
@@ -378,33 +382,39 @@ public class BundleWebApplicationClassSpace {
 				continue;
 			}
 
+			toProcess.add(scannedBundle);
 			Set<Bundle> reachable = new HashSet<>();
-			ClassPathUtil.getBundlesInClassSpace(scannedBundle, reachable);
+			getBundlesInClassSpace(scannedBundle, reachable);
 			for (Bundle rb : reachable) {
-				if (!reached.contains(rb) && !processedBundles.contains(rb) && !Utils.isFragment(rb)) {
-					reached.add(rb);
-					bundles.add(rb);
+				if (!processedBundles.contains(rb) && !Utils.isFragment(rb)) {
+					toProcess.add(rb);
 				}
 			}
-			if (processedBundles.contains(scannedBundle)) {
-				continue;
-			}
+			toProcess.addAll(reachable);
 
-			LOG.trace("  Checking wired bundle {}", scannedBundle);
-			try {
-				extenderContext.skipBundleScanning(scannedBundle);
-				List<WebXml> fragmentList = process(scannedBundle, parseRequired);
-				for (WebXml fragment : fragmentList) {
-					addFragment(fragment);
-					if (!fragment.getWebappJar()) {
-						containerFragmentBundles.put(fragment.getJarName(), scannedBundle);
-					} else {
-						applicationFragmentBundles.put(fragment.getJarName(), scannedBundle);
+		}
+
+		// remove all that are already processed, like the original wabBundle
+		toProcess.removeAll(processedBundles);
+
+		for (Bundle bundle : toProcess) {
+			if (extenderContext.skipBundleScanning(bundle) || bundle.getBundleId() == 0L) {
+					LOG.trace("  Skipped checking of wired bundle {}", bundle);
+			} else {
+				LOG.trace("  Checking wired bundle {}", bundle);
+				try {
+					List<WebXml> fragmentList = process(bundle, parseRequired);
+					for (WebXml fragment : fragmentList) {
+						addFragment(fragment);
+						if (!fragment.getWebappJar()) {
+							containerFragmentBundles.put(fragment.getJarName(), bundle);
+						} else {
+							applicationFragmentBundles.put(fragment.getJarName(), bundle);
+						}
 					}
+				} catch (Exception e) {
+					LOG.warn("  Problem scanning wired bundle {}: {}", bundle, e.getMessage(), e);
 				}
-				processedBundles.add(scannedBundle);
-			} catch (Exception e) {
-				LOG.warn("  Problem scanning wired bundle {}: {}", scannedBundle, e.getMessage(), e);
 			}
 		}
 
@@ -434,6 +444,74 @@ public class BundleWebApplicationClassSpace {
 		delegateBundles.remove(wabBundle);
 
 		delegateBundles.forEach(this.wabClassLoader::addBundle);
+	}
+
+	/**
+	 * this is a non-transient version of {@link ClassPathUtil#getBundlesInClassSpace(Bundle, Set)} to only get direct dependencies
+	 * @param bundle
+	 * @param bundleSet
+	 * @return
+	 */
+	private static Set<Bundle> getBundlesInClassSpace(Bundle bundle, Set<Bundle> bundleSet) {
+		BundleWiring bundleWiring = bundle == null ? null : bundle.adapt(BundleWiring.class);
+
+		if (bundle == null || bundleWiring == null) {
+			return Collections.emptySet();
+		}
+
+		Set<Bundle> bundles = new HashSet<>();
+
+		// This will give us all required Wires (including Require-Bundle). We're mostly interested in
+		// wires from namespaces:
+		//  - org.osgi.framework.namespace.BundleNamespace.BUNDLE_NAMESPACE = "osgi.wiring.bundle"
+		//  - org.osgi.framework.namespace.PackageNamespace.PACKAGE_NAMESPACE = "osgi.wiring.package"
+		List<BundleWire> requiredWires = bundleWiring.getRequiredWires(null);
+		for (BundleWire bundleWire : requiredWires) {
+			if (!(bundleWire.getRequirement().getNamespace().equals(BundleNamespace.BUNDLE_NAMESPACE)
+					|| (bundleWire.getRequirement().getNamespace().equals(PackageNamespace.PACKAGE_NAMESPACE)))) {
+				continue;
+			}
+			Bundle exportingBundle = bundleWire.getCapability().getRevision().getBundle();
+
+			if (exportingBundle.getBundleId() == 0) {
+				continue; // system bundle is skipped this one isn't needed
+			}
+			bundles.add(exportingBundle);
+		}
+
+		// fragments attached to checked bundle
+		List<BundleWire> providedWires = bundleWiring.getProvidedWires(BundleRevision.HOST_NAMESPACE);
+		if (providedWires != null) {
+			for (BundleWire wire : providedWires) {
+				Bundle b = wire.getRequirerWiring().getBundle();
+				bundles.add(b);
+			}
+		}
+
+		// additionally check extender bundles
+		List<BundleWire> extenderWires = bundleWiring.getRequiredWires(ExtenderNamespace.EXTENDER_NAMESPACE);
+		if (extenderWires != null) {
+			for (BundleWire wire : extenderWires) {
+				Bundle extenderBundle = wire.getCapability().getRevision().getBundle();
+				bundles.add(extenderBundle);
+			}
+		}
+
+		if (!bundleSet.containsAll(bundles)) {
+			// there are new bundles found, that are not in the set that we're collecting,
+
+			// leave the new ones
+			bundles.removeAll(bundleSet);
+			// include the new ones in the set we're collecting
+			bundleSet.addAll(bundles);
+		}
+
+		// Sanity checkpoint to remove uninstalled bundles
+		bundleSet.removeIf(b -> b.getState() == Bundle.UNINSTALLED);
+		// And system bundle
+		bundleSet.removeIf(b -> b.getBundleId() == 0L);
+
+		return bundleSet;
 	}
 
 	/**
